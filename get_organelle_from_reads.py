@@ -549,9 +549,10 @@ def get_options(description, version):
                                  "or a combination of above split by comma(s)!\n\n")
                 exit()
             elif sub_organelle_t == "anonym":
-                if not options.seed_file or not options.genes_fasta:
+                if not options.seed_file or (not options.genes_fasta and not options.general_target):
                     sys.stderr.write("\n############################################################################"
-                                     "\nERROR: \"-s\" and \"--genes\" must be specified when \"-F anonym\"!\n\n")
+                                     "\nERROR: \"-s\" must be specified when \"-F anonym\". "
+                                     "(\"--genes\" is also required if not using --general-target)\n\n")
                     exit()
             else:
                 if sub_organelle_t in ("embplant_pt", "embplant_mt"):
