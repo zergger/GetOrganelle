@@ -198,6 +198,10 @@ def get_options(description, version):
                                        "would be automatically fulfilled without warning:\t"
                                        "\nplant_cp->embplant_pt; plant_pt->embplant_pt; "
                                        "\nplant_mt->embplant_mt; plant_nr->embplant_nr")
+        group_scheme.add_argument("--general-target", dest="general_target", default=False, action="store_true",
+                                  help="Activate general-purpose targeted assembly mode. "
+                                       "This mode uses the seed to find and assemble a specific locus, "
+                                       "bypassing organelle-specific assumptions like circularity and high copy number.")
         group_scheme.add_argument("--fast", dest="fast_strategy", default=False, action="store_true",
                                   help="=\"-R 10 -t 4 -J 5 -M 7 --max-n-words 3E7 --larger-auto-ws "
                                        "--disentangle-time-limit 360\" "
@@ -4166,6 +4170,124 @@ def extract_organelle_genome(out_base, spades_output, ignore_kmer_res, slim_out_
     return export_succeeded
 
 
+
+def run_general_targeted_assembly(options, spades_output, log_handler):
+    """
+    New logic for general-purpose targeted assembly.
+    """
+    from GetOrganelleLib.assembly_parser import Assembly
+    import subprocess
+
+    log_handler.info("Running in general-purpose targeted assembly mode.")
+
+    kmer_values = sorted([int(kmer_d[1:])
+                          for kmer_d in os.listdir(spades_output)
+                          if os.path.isdir(os.path.join(spades_output, kmer_d))
+                          and kmer_d.startswith("K")
+                          and os.path.exists(os.path.join(spades_output, kmer_d, "assembly_graph.fastg"))],
+                         reverse=True)
+    if not kmer_values:
+        log_handler.error("No valid SPAdes assembly graph found!")
+        return False
+
+    largest_k = kmer_values[0]
+    kmer_dir = os.path.join(spades_output, "K" + str(largest_k))
+    graph_file = os.path.join(kmer_dir, "assembly_graph.fastg")
+    log_handler.info(f"Using assembly graph from k-mer: {largest_k}")
+
+    # 1. Create Assembly object and write contigs to FASTA
+    try:
+        assembly_graph = Assembly(graph_file, log_handler=log_handler)
+        contigs_fasta = os.path.join(kmer_dir, "contigs.fasta")
+        assembly_graph.write_to_fasta(contigs_fasta)
+    except Exception as e:
+        log_handler.error(f"Failed to parse assembly graph: {e}")
+        return False
+
+    # 2. Create BLAST database
+    blast_db_name = os.path.join(kmer_dir, "contigs_db")
+    makeblastdb_cmd = [os.path.join(options.which_blast, 'makeblastdb'), 
+                       '-in', contigs_fasta, 
+                       '-dbtype', 'nucl', 
+                       '-out', blast_db_name]
+    log_handler.info("Creating BLAST database from contigs...")
+    try:
+        subprocess.run(makeblastdb_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        log_handler.error(f"makeblastdb failed: {e.stderr}")
+        return False
+
+    # 3. BLAST seed against contig database
+    blast_out_file = os.path.join(kmer_dir, "seed_blast.out")
+    seed_file_to_use = options.seed_file[0] # Use the first seed file
+    blastn_cmd = [os.path.join(options.which_blast, 'blastn'),
+                  '-query', seed_file_to_use,
+                  '-db', blast_db_name,
+                  '-out', blast_out_file,
+                  '-outfmt', '6']
+    log_handler.info("BLASTing seed against contigs...")
+    try:
+        subprocess.run(blastn_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        log_handler.error(f"blastn failed: {e.stderr}")
+        return False
+
+    # 4. Parse BLAST output to get anchor contigs
+    anchor_contigs = set()
+    try:
+        with open(blast_out_file) as f:
+            for line in f:
+                anchor_contigs.add(line.split('\t')[1])
+    except FileNotFoundError:
+        log_handler.warning("BLAST output file not found. No anchor contigs identified.")
+        return False
+
+    if not anchor_contigs:
+        log_handler.warning("No contigs found matching the seed sequence.")
+        return False
+    log_handler.info(f"Found {len(anchor_contigs)} anchor contigs.")
+
+    # 5. Graph Traversal
+    def get_subgraph_contigs(graph, anchor_nodes):
+        subgraph_nodes = set()
+        nodes_to_visit = list(anchor_nodes)
+        
+        while nodes_to_visit:
+            current_node_name = nodes_to_visit.pop(0)
+            if current_node_name in subgraph_nodes:
+                continue
+            
+            subgraph_nodes.add(current_node_name)
+            
+            if current_node_name not in graph.vertex_info:
+                log_handler.warning(f"Contig {current_node_name} from BLAST not found in graph. Skipping.")
+                continue
+                
+            current_node = graph.vertex_info[current_node_name]
+            
+            for end in (True, False): # tail and head
+                for neighbor_name, neighbor_end in current_node.connections[end]:
+                    if neighbor_name not in subgraph_nodes:
+                        nodes_to_visit.append(neighbor_name)
+                        
+        return subgraph_nodes
+
+    log_handler.info("Traversing graph from anchor contigs...")
+    subgraph_contig_names = get_subgraph_contigs(assembly_graph, anchor_contigs)
+    log_handler.info(f"Found {len(subgraph_contig_names)} contigs in the target subgraph.")
+
+    # 6. Extract and write final contigs
+    final_contigs_file = os.path.join(options.output_base, options.prefix + "targeted_assembly.fasta")
+    with open(final_contigs_file, "w") as outfile:
+        for contig_name in sorted(list(subgraph_contig_names), key=lambda x: int(x)):
+            if contig_name in assembly_graph.vertex_info:
+                vertex = assembly_graph.vertex_info[contig_name]
+                header = vertex.fastg_form_name if vertex.fastg_form_name else f"NODE_{contig_name}"
+                outfile.write(f">{header}\n{vertex.seq[True]}\n")
+
+    log_handler.info(f"General-purpose assembly finished. Results written to {final_contigs_file}")
+    return True
+
 def main():
     time0 = time.time()
     from GetOrganelleLib.versions import get_versions
@@ -4537,73 +4659,76 @@ def main():
 
         """ export organelle """
         if is_assembled and run_slim:
-            slim_stat_list, ignore_k = slim_spades_result(
-                organelle_types=options.organelle_type, in_custom=options.genes_fasta, ex_custom=options.exclude_genes,
-                spades_output=spades_output, ignore_kmer_res=options.ignore_kmer_res,
-                max_slim_extending_len=slim_extending_len,
-                verbose_log=options.verbose_log, log_handler=log_handler, threads=options.threads,
-                which_blast=options.which_blast, resume=options.script_resume, keep_temp=options.keep_temp_files)
-            slim_stat_codes = [s_code for s_code, fastg_out in slim_stat_list]
-            slim_fastg_file = [fastg_out for s_code, fastg_out in slim_stat_list]
-            options.ignore_kmer_res = ignore_k
-            if set(slim_stat_codes) == {2}:
-                log_handler.warning("No sequence hit our LabelDatabase!")
-                log_handler.warning("This might due to unreasonable seed/parameter choices or a bug.")
-                log_handler.info("Please open an issue at https://github.com/Kinggerm/GetOrganelle/issues "
-                                 "with the get_org.log.txt file.\n")
-            elif 0 in slim_stat_codes:
-                log_handler.info("Slimming assembly graphs finished.\n")
-                if run_disentangle:
-                    organelle_type_prefix = []
-                    duplicated_o_types = {o_type: 1
-                                          for o_type in options.organelle_type
-                                          if options.organelle_type.count(o_type) > 1}
-                    for here_type in options.organelle_type:
-                        if here_type in duplicated_o_types:
-                            organelle_type_prefix.append(here_type + "-" + str(duplicated_o_types[here_type]))
-                            duplicated_o_types[here_type] += 1
-                        else:
-                            organelle_type_prefix.append(here_type)
-                    for go_t, sub_organelle_type in enumerate(options.organelle_type):
-                        og_prefix = options.prefix + organelle_type_prefix[go_t]
-                        graph_existed = bool([gfa_f for gfa_f in os.listdir(out_base)
-                                              if gfa_f.startswith(og_prefix) and gfa_f.endswith(".path_sequence.gfa")])
-                        fasta_existed = bool([fas_f for fas_f in os.listdir(out_base)
-                                              if fas_f.startswith(og_prefix) and fas_f.endswith(".path_sequence.fasta")])
-                        if resume and graph_existed and fasta_existed:
-                            log_handler.info("Extracting " + sub_organelle_type + " from the assemblies ... skipped.\n")
-                        else:
-                            # log_handler.info("Parsing assembly graph and outputting ...")
-                            log_handler.info("Extracting " + sub_organelle_type + " from the assemblies ...")
-                            if options.genes_fasta:
-                                db_base_name = remove_db_postfix(os.path.basename(options.genes_fasta[go_t]))
-                            else:
-                                db_base_name = sub_organelle_type
-                            ext_res = extract_organelle_genome(out_base=out_base, spades_output=spades_output,
-                                                               ignore_kmer_res=options.ignore_kmer_res,
-                                                               slim_out_fg=slim_fastg_file, organelle_prefix=og_prefix,
-                                                               organelle_type=sub_organelle_type,
-                                                               blast_db=db_base_name,
-                                                               read_len_for_log=mean_read_len,
-                                                               verbose=options.verbose_log, log_handler=log_handler,
-                                                               basic_prefix=options.prefix,
-                                                               expected_minimum_size=options.expected_min_size[go_t],
-                                                               expected_maximum_size=options.expected_max_size[go_t],
-                                                               options=options,
-                                                               do_spades_scaffolding=reads_paired["input"])
-                            if ext_res:
-                                log_handler.info("Extracting " + sub_organelle_type + " from the assemblies finished.\n")
-                            else:
-                                log_handler.info("Extracting " + sub_organelle_type + " from the assemblies failed.\n")
+            if options.general_target:
+                run_general_targeted_assembly(options, spades_output, log_handler)
             else:
-                log_handler.error("No valid assembly graph found!")
-                log_handler.warning("This might due to a damaged dependency, "
-                                    "to unreasonable seed/parameter choices, or to a bug.")
-                log_handler.info("Please first search similar issues at "
-                                 "https://github.com/Kinggerm/GetOrganelle/issues, "
-                                 "then leave your message following the same issue, "
-                                 "or open an issue at https://github.com/Kinggerm/GetOrganelle/issues if it is new, "
-                                 "Please always attach the get_org.log.txt file.\n")
+                slim_stat_list, ignore_k = slim_spades_result(
+                    organelle_types=options.organelle_type, in_custom=options.genes_fasta, ex_custom=options.exclude_genes,
+                    spades_output=spades_output, ignore_kmer_res=options.ignore_kmer_res,
+                    max_slim_extending_len=slim_extending_len,
+                    verbose_log=options.verbose_log, log_handler=log_handler, threads=options.threads,
+                    which_blast=options.which_blast, resume=options.script_resume, keep_temp=options.keep_temp_files)
+                slim_stat_codes = [s_code for s_code, fastg_out in slim_stat_list]
+                slim_fastg_file = [fastg_out for s_code, fastg_out in slim_stat_list]
+                options.ignore_kmer_res = ignore_k
+                if set(slim_stat_codes) == {2}:
+                    log_handler.warning("No sequence hit our LabelDatabase!")
+                    log_handler.warning("This might due to unreasonable seed/parameter choices or a bug.")
+                    log_handler.info("Please open an issue at https://github.com/Kinggerm/GetOrganelle/issues "
+                                     "with the get_org.log.txt file.\n")
+                elif 0 in slim_stat_codes:
+                    log_handler.info("Slimming assembly graphs finished.\n")
+                    if run_disentangle:
+                        organelle_type_prefix = []
+                        duplicated_o_types = {o_type: 1
+                                              for o_type in options.organelle_type
+                                              if options.organelle_type.count(o_type) > 1}
+                        for here_type in options.organelle_type:
+                            if here_type in duplicated_o_types:
+                                organelle_type_prefix.append(here_type + "-" + str(duplicated_o_types[here_type]))
+                                duplicated_o_types[here_type] += 1
+                            else:
+                                organelle_type_prefix.append(here_type)
+                        for go_t, sub_organelle_type in enumerate(options.organelle_type):
+                            og_prefix = options.prefix + organelle_type_prefix[go_t]
+                            graph_existed = bool([gfa_f for gfa_f in os.listdir(out_base)
+                                                  if gfa_f.startswith(og_prefix) and gfa_f.endswith(".path_sequence.gfa")])
+                            fasta_existed = bool([fas_f for fas_f in os.listdir(out_base)
+                                                  if fas_f.startswith(og_prefix) and fas_f.endswith(".path_sequence.fasta")])
+                            if resume and graph_existed and fasta_existed:
+                                log_handler.info("Extracting " + sub_organelle_type + " from the assemblies ... skipped.\n")
+                            else:
+                                # log_handler.info("Parsing assembly graph and outputting ...")
+                                log_handler.info("Extracting " + sub_organelle_type + " from the assemblies ...")
+                                if options.genes_fasta:
+                                    db_base_name = remove_db_postfix(os.path.basename(options.genes_fasta[go_t]))
+                                else:
+                                    db_base_name = sub_organelle_type
+                                ext_res = extract_organelle_genome(out_base=out_base, spades_output=spades_output,
+                                                                   ignore_kmer_res=options.ignore_kmer_res,
+                                                                   slim_out_fg=slim_fastg_file, organelle_prefix=og_prefix,
+                                                                   organelle_type=sub_organelle_type,
+                                                                   blast_db=db_base_name,
+                                                                   read_len_for_log=mean_read_len,
+                                                                   verbose=options.verbose_log, log_handler=log_handler,
+                                                                   basic_prefix=options.prefix,
+                                                                   expected_minimum_size=options.expected_min_size[go_t],
+                                                                   expected_maximum_size=options.expected_max_size[go_t],
+                                                                   options=options,
+                                                                   do_spades_scaffolding=reads_paired["input"])
+                                if ext_res:
+                                    log_handler.info("Extracting " + sub_organelle_type + " from the assemblies finished.\n")
+                                else:
+                                    log_handler.info("Extracting " + sub_organelle_type + " from the assemblies failed.\n")
+                else:
+                    log_handler.error("No valid assembly graph found!")
+                    log_handler.warning("This might due to a damaged dependency, "
+                                        "to unreasonable seed/parameter choices, or to a bug.")
+                    log_handler.info("Please first search similar issues at "
+                                     "https://github.com/Kinggerm/GetOrganelle/issues, "
+                                     "then leave your message following the same issue, "
+                                     "or open an issue at https://github.com/Kinggerm/GetOrganelle/issues if it is new, "
+                                     "Please always attach the get_org.log.txt file.\n")
         log_handler = simple_log(log_handler, out_base, prefix=options.prefix + "get_org.")
         log_handler.info("\nTotal cost " + "%.2f" % (time.time() - time0) + " s")
         log_handler.info("Thank you!")
