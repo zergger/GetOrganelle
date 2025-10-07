@@ -849,11 +849,14 @@ def get_options(description, version):
                 elif sub_organelle_t in ("embplant_nr", "animal_mt", "fungus_nr"):
                     options.target_genome_size.append(int(raw_default_value / 10))
                 elif sub_organelle_t == "anonym":
-                    ref_seqs = read_fasta(options.genes_fasta[go_t])[1]
-                    options.target_genome_size.append(2 * sum([len(this_seq) for this_seq in ref_seqs]))
-                    log_handler.info(
-                        "Setting '--target-genome-size " + ",".join([str(t_s) for t_s in options.target_genome_size]) +
-                        "' for estimating the word size value for anonym type.")
+                    if options.genes_fasta and go_t < len(options.genes_fasta):
+                        ref_seqs = read_fasta(options.genes_fasta[go_t])[1]
+                        options.target_genome_size.append(2 * sum([len(this_seq) for this_seq in ref_seqs]))
+                        log_handler.info(
+                            "Setting '--target-genome-size " + ",".join([str(t_s) for t_s in options.target_genome_size]) +
+                            "' for estimating the word size value for anonym type.")
+                    else:
+                        options.target_genome_size.append(raw_default_value)
                 else:
                     options.target_genome_size.append(raw_default_value)
         else:
