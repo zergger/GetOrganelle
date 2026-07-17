@@ -12,6 +12,20 @@ from argparse import ArgumentParser
 import GetOrganelleLib
 from GetOrganelleLib.seq_parser import *
 from GetOrganelleLib.pipe_control_func import *
+from GetOrganelleLib.targeted_assembly import (
+    BLAST_OUTFMT_FIELDS,
+    TARGET_EXTRACTION_LABEL,
+    TARGET_EXTRACTION_MODES,
+    TARGET_EXTRACTION_SEED_NEIGHBORHOOD,
+    build_unambiguous_candidate_paths,
+    collect_subgraph_nodes,
+    extract_subgraph,
+    find_branching_anchors,
+    find_possible_paralogs,
+    parse_blast_hits,
+    parse_graph_hops,
+    resolve_target_extraction_mode,
+)
 import time
 import random
 import subprocess
@@ -91,6 +105,13 @@ def get_options(description, version):
                             help="Target organelle genome type(s): "
                                  "embplant_pt/other_pt/embplant_mt/embplant_nr/animal_mt/fungus_mt/fungus_nr/anonym/"
                                  "embplant_pt,embplant_mt/other_pt,embplant_mt,fungus_mt")
+        parser.add_argument(
+            "--general-target", dest="general_target", action="store_true",
+            help="Compatibility alias for '--target-extraction seed-neighborhood'.")
+        parser.add_argument(
+            "--target-extraction", dest="target_extraction",
+            choices=TARGET_EXTRACTION_MODES,
+            help="Assembly-graph extraction backend: label or seed-neighborhood.")
         parser.add_argument("--max-reads", type=float,
                             help="Maximum number of reads to be used per file. "
                                  "Default: 1.5E7 (-F embplant_pt/embplant_nr/fungus_mt/fungus_nr); "
@@ -198,10 +219,17 @@ def get_options(description, version):
                                        "would be automatically fulfilled without warning:\t"
                                        "\nplant_cp->embplant_pt; plant_pt->embplant_pt; "
                                        "\nplant_mt->embplant_mt; plant_nr->embplant_nr")
-        group_scheme.add_argument("--general-target", dest="general_target", default=False, action="store_true",
-                                  help="Activate general-purpose targeted assembly mode. "
-                                       "This mode uses the seed to find and assemble a specific locus, "
-                                       "bypassing organelle-specific assumptions like circularity and high copy number.")
+        group_scheme.add_argument(
+            "--target-extraction", dest="target_extraction",
+            choices=TARGET_EXTRACTION_MODES,
+            help="Choose the assembly-graph extraction backend. 'label' preserves the upstream "
+                 "-s + --genes slimming/disentangling workflow and is the default. "
+                 "'seed-neighborhood' uses the seed as a post-assembly BLAST anchor, exports a bounded "
+                 "graph neighborhood and conservatively joined candidate paths.")
+        group_scheme.add_argument(
+            "--general-target", dest="general_target", default=False, action="store_true",
+            help="Compatibility alias for '--target-extraction seed-neighborhood'. "
+                 "Do not combine it with '--target-extraction label'.")
         group_scheme.add_argument("--fast", dest="fast_strategy", default=False, action="store_true",
                                   help="=\"-R 10 -t 4 -J 5 -M 7 --max-n-words 3E7 --larger-auto-ws "
                                        "--disentangle-time-limit 360\" "
@@ -220,6 +248,42 @@ def get_options(description, version):
                                        "--min-quality-score -5 --max-ignore-percent 0\" "
                                        "You can overwrite the value of a specific option listed above by adding "
                                        "that option along with the \"--memory-unlimited\" flag. ")
+        group_targeted = parser.add_argument_group(
+            "SEED-NEIGHBORHOOD OPTIONS",
+            "Options used only with '--target-extraction seed-neighborhood' "
+            "(or its compatibility alias '--general-target').")
+        group_targeted.add_argument(
+            "--target-min-identity", dest="target_min_identity", type=float, default=70.,
+            help="Minimum BLAST nucleotide identity percentage for accepting an anchor contig. "
+                 "Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-min-query-coverage", dest="target_min_query_coverage", type=float, default=20.,
+            help="Minimum BLAST query coverage per subject percentage for accepting an anchor contig. "
+                 "A partial exon-sized hit can therefore seed a candidate locus. Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-max-evalue", dest="target_max_evalue", type=float, default=1E-5,
+            help="Maximum BLAST e-value for accepting an anchor contig. Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-max-anchor-contigs", dest="target_max_anchor_contigs", type=int, default=50,
+            help="Maximum number of distinct seed-hit contigs retained after ranking by bit score. "
+                 "Choose 0 for no limit. Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-max-graph-hops", dest="target_max_graph_hops", default="10",
+            help="Maximum assembly-graph edge distance from any anchor contig. "
+                 "Choose inf to recover the historical whole connected component. Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-max-path-nodes", dest="target_max_path_nodes", type=int, default=100,
+            help="Maximum nodes in each conservatively joined, non-branching candidate path. "
+                 "Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-paralog-score-ratio", dest="target_paralog_score_ratio", type=float, default=0.9,
+            help="Warn when one seed query has multiple contig hits whose bit scores are at least "
+                 "this fraction of its best hit. Such hits may represent paralogs, alleles, or fragments. "
+                 "Default: %(default)s")
+        group_targeted.add_argument(
+            "--target-remap-reads", dest="target_remap_reads", default=False, action="store_true",
+            help="After candidate-path export, map the original reads back using "
+                 "evaluate_assembly_using_mapping.py. This scans the full input and is disabled by default.")
         # group 3
         group_extending = parser.add_argument_group("EXTENDING OPTIONS",
                                                     "Options on the performance of extending process")
@@ -491,6 +555,49 @@ def get_options(description, version):
         sys.stderr.write("\n\"-h\" for more usage\n")
         exit()
     else:
+        options.legacy_general_target_requested = options.general_target
+        try:
+            options.target_extraction = resolve_target_extraction_mode(
+                requested_mode=options.target_extraction,
+                legacy_general_target=options.legacy_general_target_requested)
+        except ValueError as error:
+            sys.stderr.write(
+                "\n############################################################################"
+                "\nERROR: " + str(error) + "\n\n")
+            sys.exit(1)
+        options.general_target = (
+            options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD)
+        seed_neighborhood_only_options = (
+            "--target-min-identity",
+            "--target-min-query-coverage",
+            "--target-max-evalue",
+            "--target-max-anchor-contigs",
+            "--target-max-graph-hops",
+            "--target-max-path-nodes",
+            "--target-paralog-score-ratio",
+            "--target-remap-reads",
+        )
+        explicitly_used_seed_neighborhood_options = [
+            option_name
+            for option_name in seed_neighborhood_only_options
+            if any(
+                argument == option_name or argument.startswith(option_name + "=")
+                for argument in sys.argv[1:])
+        ]
+        if options.target_extraction == TARGET_EXTRACTION_LABEL and \
+                explicitly_used_seed_neighborhood_options:
+            sys.stderr.write(
+                "\n############################################################################"
+                "\nERROR: " + ", ".join(explicitly_used_seed_neighborhood_options) +
+                " require '--target-extraction seed-neighborhood'.\n\n")
+            sys.exit(1)
+        if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD and \
+                (options.genes_fasta or options.exclude_genes):
+            sys.stderr.write(
+                "\n############################################################################"
+                "\nERROR: '--genes' and '--ex-genes' belong to '--target-extraction label'. "
+                "Omit them when using seed-neighborhood extraction.\n\n")
+            sys.exit(1)
         # if pos_args:
         #     sys.stderr.write("\n############################################################################"
         #                      "\nUnrecognized options: " + "\", \"".join(pos_args) + "\n")
@@ -512,6 +619,13 @@ def get_options(description, version):
             exit()
         else:
             options.organelle_type = options.organelle_type.split(",")
+        if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD and \
+                len(options.organelle_type) != 1:
+            sys.stderr.write(
+                "\n############################################################################"
+                "\nERROR: '--target-extraction seed-neighborhood' currently supports exactly "
+                "one '-F' target and one seed per run.\n\n")
+            sys.exit(1)
         if int(bool(options.fq_file_1)) + int(bool(options.fq_file_2)) == 1:
             sys.stderr.write("\n############################################################################"
                              "\nERROR: unbalanced paired reads!\n\n")
@@ -549,11 +663,16 @@ def get_options(description, version):
                                  "or a combination of above split by comma(s)!\n\n")
                 exit()
             elif sub_organelle_t == "anonym":
-                if not options.seed_file or (not options.genes_fasta and not options.general_target):
+                if not options.seed_file:
                     sys.stderr.write("\n############################################################################"
-                                     "\nERROR: \"-s\" must be specified when \"-F anonym\". "
-                                     "(\"--genes\" is also required if not using --general-target)\n\n")
-                    exit()
+                                     "\nERROR: \"-s\" must be specified when \"-F anonym\".\n\n")
+                    sys.exit(1)
+                if options.target_extraction == TARGET_EXTRACTION_LABEL and \
+                        not options.genes_fasta:
+                    sys.stderr.write("\n############################################################################"
+                                     "\nERROR: \"--genes\" must be specified when \"-F anonym\" uses "
+                                     "\"--target-extraction label\".\n\n")
+                    sys.exit(1)
             else:
                 if sub_organelle_t in ("embplant_pt", "embplant_mt"):
                     for go_t, check_sub in enumerate(["embplant_pt", "embplant_mt"]):
@@ -628,6 +747,30 @@ def get_options(description, version):
         assert options.max_paths_num > 0
         assert options.phred_offset in (-1, 64, 33)
         assert options.script_resume + options.script_overwrite < 2, "'--overwrite' conflicts with '--continue'"
+        if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD:
+            if not 0 <= options.target_min_identity <= 100:
+                sys.stderr.write("\n--target-min-identity must be between 0 and 100!\n")
+                exit()
+            if not 0 <= options.target_min_query_coverage <= 100:
+                sys.stderr.write("\n--target-min-query-coverage must be between 0 and 100!\n")
+                exit()
+            if options.target_max_evalue < 0:
+                sys.stderr.write("\n--target-max-evalue must be non-negative!\n")
+                exit()
+            if options.target_max_anchor_contigs < 0:
+                sys.stderr.write("\n--target-max-anchor-contigs must be non-negative!\n")
+                exit()
+            if options.target_max_path_nodes < 1:
+                sys.stderr.write("\n--target-max-path-nodes must be a positive integer!\n")
+                exit()
+            if not 0 < options.target_paralog_score_ratio <= 1:
+                sys.stderr.write("\n--target-paralog-score-ratio must be in the interval (0, 1]!\n")
+                exit()
+            try:
+                options.target_max_graph_hops = parse_graph_hops(options.target_max_graph_hops)
+            except ValueError as error:
+                sys.stderr.write("\n" + str(error) + "\n")
+                exit()
         options.prefix = os.path.basename(options.prefix)
         if os.path.isdir(options.output_base):
             if options.script_resume:
@@ -665,6 +808,11 @@ def get_options(description, version):
         log_handler.info(description)
         log_handler.info("Python " + str(sys.version).replace("\n", " "))
         log_handler.info("PLATFORM: " + " ".join(platform.uname()))
+        log_handler.info("TARGET EXTRACTION: " + options.target_extraction)
+        if options.legacy_general_target_requested:
+            log_handler.warning(
+                "'--general-target' is retained as a compatibility alias for "
+                "'--target-extraction seed-neighborhood'.")
         # log versions of dependencies
         lib_versions_info = []
         lib_not_available = []
@@ -789,6 +937,20 @@ def get_options(description, version):
             if "--max-ignore-percent" not in sys.argv:
                 options.maximum_ignore_percent = 0
 
+        if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD and \
+                "-P" not in sys.argv and not options.memory_unlimited:
+            options.pre_grouped = 0
+            log_handler.info(
+                "Setting '-P 0' for seed-neighborhood extraction because low-copy or short nuclear targets "
+                "do not satisfy the high-copy pre-grouping assumption. Use an explicit -P value to override.")
+        if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD and \
+                "-R" not in sys.argv and "--max-rounds" not in sys.argv:
+            options.max_rounds = 10
+            log_handler.info(
+                "Setting '-R 10' for seed-neighborhood extraction to avoid the infinite-round default "
+                "associated with '-P 0'. "
+                "Use an explicit -R value to override.")
+
         # using the default
         if "--max-reads" not in sys.argv:
             if "embplant_mt" in options.organelle_type or "anonym" in options.organelle_type:
@@ -855,6 +1017,14 @@ def get_options(description, version):
                         log_handler.info(
                             "Setting '--target-genome-size " + ",".join([str(t_s) for t_s in options.target_genome_size]) +
                             "' for estimating the word size value for anonym type.")
+                    elif options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD:
+                        seed_seqs = read_fasta(options.seed_file[go_t])[1]
+                        estimated_target_size = max(1000, 2 * sum([len(this_seq) for this_seq in seed_seqs]))
+                        options.target_genome_size.append(estimated_target_size)
+                        log_handler.info(
+                            "Setting '--target-genome-size " + str(estimated_target_size) +
+                            "' from the seed length for seed-neighborhood extraction. "
+                            "Use an explicit value when the expected genomic span is much larger than the seed.")
                     else:
                         options.target_genome_size.append(raw_default_value)
                 else:
@@ -982,7 +1152,9 @@ def get_options(description, version):
                                     " not accessible! Slimming/Disentangling disabled!!\n")
                 run_slim = False
                 run_disentangle = False
-            if options.genes_fasta and not executable(os.path.join(options.which_blast, "makeblastdb")):
+            if (options.genes_fasta or
+                    options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD) and \
+                    not executable(os.path.join(options.which_blast, "makeblastdb")):
                 log_handler.error(os.path.join(options.which_blast, "makeblastdb") +
                                     " not accessible! Slimming/Disentangling disabled!!\n")
                 run_slim = False
@@ -4175,21 +4347,87 @@ def extract_organelle_genome(out_base, spades_output, ignore_kmer_res, slim_out_
 
 
 
+def _run_target_command(command, command_name, log_handler):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout_data, stderr_data = process.communicate()
+    if process.returncode:
+        stderr_text = stderr_data.decode("utf8", "replace") if hasattr(stderr_data, "decode") else str(stderr_data)
+        stdout_text = stdout_data.decode("utf8", "replace") if hasattr(stdout_data, "decode") else str(stdout_data)
+        log_handler.error(command_name + " failed with exit code " + str(process.returncode) + ".")
+        if stderr_text.strip():
+            log_handler.error(stderr_text.strip())
+        elif stdout_text.strip():
+            log_handler.error(stdout_text.strip())
+        return False
+    return True
+
+
+def _write_wrapped_fasta_record(out_handle, label, sequence, line_width=70):
+    out_handle.write(">" + label + "\n")
+    for start_at in range(0, len(sequence), line_width):
+        out_handle.write(sequence[start_at:start_at + line_width] + "\n")
+
+
+def _write_target_hit_table(output_file, passing_hits, selected_hits):
+    selected_subjects = {hit["sseqid"] for hit in selected_hits}
+    with open(output_file, "w") as out_handle:
+        out_handle.write("\t".join(BLAST_OUTFMT_FIELDS + ("selected_anchor",)) + "\n")
+        for hit in passing_hits:
+            values = [str(hit[field]) for field in BLAST_OUTFMT_FIELDS]
+            values.append(("no", "yes")[hit["sseqid"] in selected_subjects])
+            out_handle.write("\t".join(values) + "\n")
+
+
+def _run_target_read_remapping(options, candidate_paths_file, log_handler):
+    remap_script = os.path.join(UTILITY_PATH, "evaluate_assembly_using_mapping.py")
+    remap_output = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.read_mapping")
+    command = [
+        sys.executable, remap_script,
+        "-f", candidate_paths_file,
+        "-o", remap_output,
+        "-t", str(options.threads),
+        "-c", "no",
+        "--which-bowtie2", options.which_bowtie2
+    ]
+    if options.fq_file_1 and options.fq_file_2:
+        command.extend([
+            "-1", os.path.abspath(options.fq_file_1),
+            "-2", os.path.abspath(options.fq_file_2)
+        ])
+    if options.unpaired_fq_files:
+        command.extend([
+            "-u", ",".join([os.path.abspath(fq_file) for fq_file in options.unpaired_fq_files])
+        ])
+    if options.script_resume:
+        command.append("--continue")
+    log_handler.info(
+        "Mapping original reads back to targeted candidate paths. "
+        "This optional step scans the full input library.")
+    return _run_target_command(command, "Target read remapping", log_handler)
+
+
 def run_general_targeted_assembly(options, spades_output, log_handler):
     """
-    New logic for general-purpose targeted assembly.
+    Identify seed-supported contigs, extract a bounded graph neighborhood, and
+    conservatively join only non-branching paths. Branches are retained in GFA.
     """
     from GetOrganelleLib.assembly_parser import Assembly
-    import subprocess
 
-    log_handler.info("Running in general-purpose targeted assembly mode.")
+    log_handler.info("Running seed-neighborhood target extraction.")
+    log_handler.info(
+        "Anchor thresholds: identity >= " + str(options.target_min_identity) +
+        "%; query coverage >= " + str(options.target_min_query_coverage) +
+        "%; e-value <= " + str(options.target_max_evalue) + ".")
 
-    kmer_values = sorted([int(kmer_d[1:])
-                          for kmer_d in os.listdir(spades_output)
-                          if os.path.isdir(os.path.join(spades_output, kmer_d))
-                          and kmer_d.startswith("K")
-                          and os.path.exists(os.path.join(spades_output, kmer_d, "assembly_graph.fastg"))],
-                         reverse=True)
+    kmer_values = sorted(
+        [int(kmer_dir_name[1:])
+         for kmer_dir_name in os.listdir(spades_output)
+         if os.path.isdir(os.path.join(spades_output, kmer_dir_name))
+         and kmer_dir_name.startswith("K")
+         and os.path.exists(os.path.join(
+             spades_output, kmer_dir_name, "assembly_graph.fastg"))],
+        reverse=True)
     if not kmer_values:
         log_handler.error("No valid SPAdes assembly graph found!")
         return False
@@ -4197,99 +4435,203 @@ def run_general_targeted_assembly(options, spades_output, log_handler):
     largest_k = kmer_values[0]
     kmer_dir = os.path.join(spades_output, "K" + str(largest_k))
     graph_file = os.path.join(kmer_dir, "assembly_graph.fastg")
-    log_handler.info(f"Using assembly graph from k-mer: {largest_k}")
+    log_handler.info("Using assembly graph from k-mer: " + str(largest_k))
 
-    # 1. Create Assembly object and write contigs to FASTA
     try:
         assembly_graph = Assembly(graph_file, log_handler=log_handler)
         contigs_fasta = os.path.join(kmer_dir, "contigs.fasta")
         assembly_graph.write_to_fasta(contigs_fasta)
-    except Exception as e:
-        log_handler.error(f"Failed to parse assembly graph: {e}")
+    except Exception as error:
+        log_handler.error("Failed to parse assembly graph: " + str(error))
         return False
 
-    # 2. Create BLAST database
+    makeblastdb = os.path.join(options.which_blast, "makeblastdb")
+    blastn = os.path.join(options.which_blast, "blastn")
+    if not executable(makeblastdb):
+        log_handler.error(makeblastdb + " not accessible!")
+        return False
+
     blast_db_name = os.path.join(kmer_dir, "contigs_db")
-    makeblastdb_cmd = [os.path.join(options.which_blast, 'makeblastdb'), 
-                       '-in', contigs_fasta, 
-                       '-dbtype', 'nucl', 
-                       '-out', blast_db_name]
-    log_handler.info("Creating BLAST database from contigs...")
-    try:
-        subprocess.run(makeblastdb_cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        log_handler.error(f"makeblastdb failed: {e.stderr}")
+    makeblastdb_command = [
+        makeblastdb, "-in", contigs_fasta, "-dbtype", "nucl", "-out", blast_db_name
+    ]
+    log_handler.info("Creating BLAST database from assembly-graph contigs...")
+    if not _run_target_command(makeblastdb_command, "makeblastdb", log_handler):
         return False
 
-    # 3. BLAST seed against contig database
     blast_out_file = os.path.join(kmer_dir, "seed_blast.out")
-    seed_file_to_use = options.seed_file[0] # Use the first seed file
-    blastn_cmd = [os.path.join(options.which_blast, 'blastn'),
-                  '-query', seed_file_to_use,
-                  '-db', blast_db_name,
-                  '-out', blast_out_file,
-                  '-outfmt', '6']
-    log_handler.info("BLASTing seed against contigs...")
-    try:
-        subprocess.run(blastn_cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        log_handler.error(f"blastn failed: {e.stderr}")
+    seed_file_to_use = options.seed_file[0]
+    blastn_command = [
+        blastn,
+        "-query", seed_file_to_use,
+        "-db", blast_db_name,
+        "-out", blast_out_file,
+        "-outfmt", "6 " + " ".join(BLAST_OUTFMT_FIELDS)
+    ]
+    log_handler.info("BLASTing seed against assembly-graph contigs...")
+    if not _run_target_command(blastn_command, "blastn", log_handler):
         return False
 
-    # 4. Parse BLAST output to get anchor contigs
-    anchor_contigs = set()
     try:
-        with open(blast_out_file) as f:
-            for line in f:
-                anchor_contigs.add(line.split('\t')[1])
-    except FileNotFoundError:
-        log_handler.warning("BLAST output file not found. No anchor contigs identified.")
+        selected_hits, passing_hits, hits_truncated = parse_blast_hits(
+            blast_out_file=blast_out_file,
+            min_identity=options.target_min_identity,
+            min_query_coverage=options.target_min_query_coverage,
+            max_evalue=options.target_max_evalue,
+            max_anchor_contigs=options.target_max_anchor_contigs)
+    except (IOError, ValueError) as error:
+        log_handler.error("Failed to parse targeted BLAST hits: " + str(error))
         return False
 
+    hit_table_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.anchor_hits.tsv")
+    _write_target_hit_table(hit_table_file, passing_hits, selected_hits)
+    if not selected_hits:
+        log_handler.warning("No contigs passed the configured seed-hit thresholds.")
+        return False
+    if hits_truncated:
+        log_handler.warning(
+            "Anchor contigs exceeded --target-max-anchor-contigs; only the highest-scoring " +
+            str(options.target_max_anchor_contigs) + " contigs were retained.")
+
+    anchor_contigs = {hit["sseqid"] for hit in selected_hits}
+    missing_anchors = sorted(anchor_contigs - set(assembly_graph.vertex_info))
+    for missing_anchor in missing_anchors:
+        log_handler.warning(
+            "Seed-hit contig " + missing_anchor + " was not found in the parsed graph.")
+    anchor_contigs -= set(missing_anchors)
     if not anchor_contigs:
-        log_handler.warning("No contigs found matching the seed sequence.")
+        log_handler.error("No retained anchor contigs were present in the parsed graph.")
         return False
-    log_handler.info(f"Found {len(anchor_contigs)} anchor contigs.")
+    log_handler.info("Retained " + str(len(anchor_contigs)) + " anchor contig(s).")
 
-    # 5. Graph Traversal
-    def get_subgraph_contigs(graph, anchor_nodes):
-        subgraph_nodes = set()
-        nodes_to_visit = list(anchor_nodes)
-        
-        while nodes_to_visit:
-            current_node_name = nodes_to_visit.pop(0)
-            if current_node_name in subgraph_nodes:
-                continue
-            
-            subgraph_nodes.add(current_node_name)
-            
-            if current_node_name not in graph.vertex_info:
-                log_handler.warning(f"Contig {current_node_name} from BLAST not found in graph. Skipping.")
-                continue
-                
-            current_node = graph.vertex_info[current_node_name]
-            
-            for end in (True, False): # tail and head
-                for neighbor_name, neighbor_end in current_node.connections[end]:
-                    if neighbor_name not in subgraph_nodes:
-                        nodes_to_visit.append(neighbor_name)
-                        
-        return subgraph_nodes
+    subgraph_contig_names, node_hops = collect_subgraph_nodes(
+        assembly_graph, anchor_contigs, options.target_max_graph_hops)
+    log_handler.info(
+        "Target graph neighborhood contains " + str(len(subgraph_contig_names)) +
+        " contig(s) within " +
+        ("inf" if options.target_max_graph_hops == inf
+         else str(options.target_max_graph_hops)) + " graph hop(s).")
 
-    log_handler.info("Traversing graph from anchor contigs...")
-    subgraph_contig_names = get_subgraph_contigs(assembly_graph, anchor_contigs)
-    log_handler.info(f"Found {len(subgraph_contig_names)} contigs in the target subgraph.")
+    target_graph = extract_subgraph(assembly_graph, subgraph_contig_names)
+    target_gfa_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.gfa")
+    target_graph.write_to_gfa(target_gfa_file)
 
-    # 6. Extract and write final contigs
-    final_contigs_file = os.path.join(options.output_base, options.prefix + "targeted_assembly.fasta")
-    with open(final_contigs_file, "w") as outfile:
-        for contig_name in sorted(list(subgraph_contig_names), key=lambda x: int(x)):
-            if contig_name in assembly_graph.vertex_info:
-                vertex = assembly_graph.vertex_info[contig_name]
-                header = vertex.fastg_form_name if vertex.fastg_form_name else f"NODE_{contig_name}"
-                outfile.write(f">{header}\n{vertex.seq[True]}\n")
+    target_nodes_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.nodes.tsv")
+    with open(target_nodes_file, "w") as node_handle:
+        node_handle.write("contig\tminimum_anchor_hops\tis_anchor\tlength\tcoverage\n")
+        for contig_name in sorted(
+                subgraph_contig_names,
+                key=lambda name: (0, int(name)) if str(name).isdigit() else (1, str(name))):
+            vertex = assembly_graph.vertex_info[contig_name]
+            node_handle.write("\t".join([
+                str(contig_name),
+                str(node_hops[contig_name]),
+                ("no", "yes")[contig_name in anchor_contigs],
+                str(vertex.len),
+                str(vertex.cov)
+            ]) + "\n")
 
-    log_handler.info(f"General-purpose assembly finished. Results written to {final_contigs_file}")
+    target_contigs_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.contigs.fasta")
+    with open(target_contigs_file, "w") as out_handle:
+        for contig_name in sorted(
+                subgraph_contig_names,
+                key=lambda name: (0, int(name)) if str(name).isdigit() else (1, str(name))):
+            vertex = assembly_graph.vertex_info[contig_name]
+            header = vertex.fastg_form_name if vertex.fastg_form_name else "NODE_" + str(contig_name)
+            _write_wrapped_fasta_record(out_handle, header, vertex.seq[True])
+
+    candidate_paths = build_unambiguous_candidate_paths(
+        graph=assembly_graph,
+        anchor_hits=selected_hits,
+        selected_nodes=subgraph_contig_names,
+        max_nodes=options.target_max_path_nodes)
+    candidate_paths_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.fasta")
+    candidate_path_table = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.paths.tsv")
+    with open(candidate_paths_file, "w") as fasta_handle, \
+            open(candidate_path_table, "w") as table_handle:
+        table_handle.write(
+            "candidate\tquery\tanchor\tlength\tnodes\tleft_stop\tright_stop\tpath\n")
+        for path_number, candidate in enumerate(candidate_paths, 1):
+            candidate_name = "target_path_" + str(path_number)
+            sequence_record = candidate["sequence"]
+            path_text = ",".join([
+                vertex_name + ("-", "+")[direction]
+                for vertex_name, direction in candidate["path"]
+            ])
+            label = (
+                candidate_name + " query=" + candidate["query"] +
+                " anchor=" + candidate["anchor"] +
+                " left_stop=" + candidate["left_stop"] +
+                " right_stop=" + candidate["right_stop"])
+            _write_wrapped_fasta_record(fasta_handle, label, sequence_record.seq)
+            table_handle.write("\t".join([
+                candidate_name,
+                candidate["query"],
+                candidate["anchor"],
+                str(len(sequence_record.seq)),
+                str(len(candidate["path"])),
+                candidate["left_stop"],
+                candidate["right_stop"],
+                path_text
+            ]) + "\n")
+
+    possible_paralogs = find_possible_paralogs(
+        passing_hits, options.target_paralog_score_ratio)
+    branching_anchors = find_branching_anchors(
+        assembly_graph, anchor_contigs, subgraph_contig_names)
+    warnings_file = os.path.join(
+        options.output_base, options.prefix + "targeted_assembly.warnings.tsv")
+    with open(warnings_file, "w") as warning_handle:
+        warning_handle.write("warning_type\tquery_or_anchor\tdetail\n")
+        if hits_truncated:
+            warning_handle.write(
+                "anchor_truncation\tall\tRetained only the highest-scoring " +
+                str(options.target_max_anchor_contigs) + " anchor contigs\n")
+        for query_name in sorted(possible_paralogs):
+            subject_summary = ",".join([
+                hit["sseqid"] + ":" + str(hit["bitscore"])
+                for hit in possible_paralogs[query_name]
+            ])
+            warning_handle.write(
+                "possible_paralog_allele_or_fragment\t" + query_name + "\t" +
+                subject_summary + "\n")
+        for anchor_name in sorted(branching_anchors):
+            degrees = branching_anchors[anchor_name]
+            warning_handle.write(
+                "branching_anchor\t" + anchor_name +
+                "\thead_degree=" + str(degrees[False]) +
+                ";tail_degree=" + str(degrees[True]) + "\n")
+
+    if possible_paralogs:
+        log_handler.warning(
+            "Multiple near-best contig hits were detected for " +
+            str(len(possible_paralogs)) +
+            " seed query/query group(s). They may represent paralogs, alleles, or fragmented copies.")
+    if branching_anchors:
+        log_handler.warning(
+            str(len(branching_anchors)) +
+            " anchor contig(s) occur at graph branches. Candidate FASTA paths stop at unresolved branches; "
+            "inspect targeted_assembly.gfa.")
+    if not candidate_paths:
+        log_handler.error("No conservative candidate paths could be exported.")
+        return False
+
+    if options.target_remap_reads:
+        if not _run_target_read_remapping(options, candidate_paths_file, log_handler):
+            return False
+    else:
+        log_handler.info(
+            "Raw-read remapping was not requested. Use --target-remap-reads when full-library scanning is acceptable.")
+
+    log_handler.info(
+        "General-purpose targeted assembly finished. Candidate paths: " +
+        candidate_paths_file + "; bounded graph: " + target_gfa_file + ".")
     return True
 
 def main():
@@ -4663,8 +5005,9 @@ def main():
 
         """ export organelle """
         if is_assembled and run_slim:
-            if options.general_target:
-                run_general_targeted_assembly(options, spades_output, log_handler)
+            if options.target_extraction == TARGET_EXTRACTION_SEED_NEIGHBORHOOD:
+                if not run_general_targeted_assembly(options, spades_output, log_handler):
+                    raise ProcessingGraphFailed("Seed-neighborhood target extraction failed.")
             else:
                 slim_stat_list, ignore_k = slim_spades_result(
                     organelle_types=options.organelle_type, in_custom=options.genes_fasta, ex_custom=options.exclude_genes,

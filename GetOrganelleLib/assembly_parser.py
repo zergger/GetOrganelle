@@ -633,6 +633,7 @@ class SimpleAssembly(object):
                             "L", vertex_name, ("-", "+")[this_end], next_v, ("-", "+")[not next_e],
                             str(this_overlap) + "M"
                         ]) + "\n")
+        out_file_handler.close()
 
 
 class Assembly(SimpleAssembly):
@@ -6837,4 +6838,3 @@ def check_positive_value(value, flag, log_handler):
         raise ValueError("illegitimate " + flag + " value " + str(value) + "!")
     else:
         return value
-

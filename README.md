@@ -140,6 +140,89 @@ But you are still highly recommended reading the following minimal introductions
     please follow [here](https://github.com/Kinggerm/GetOrganelle/wiki/FAQ#what-should-i-do-with-incomplete-resultbroken-assembly-graph) to adjust your parameters for a second run. 
     You could also use the incomplete sequence to conduct downstream analysis.
 
+### Custom target extraction (fork extension)
+
+The read-recruitment and SPAdes stages are shared, but this fork exposes two assembly-graph
+extraction backends through `--target-extraction`:
+
+* `label` preserves the upstream GetOrganelle workflow. The seed starts read recruitment, while
+  `--genes` supplies the label database used for graph slimming and disentangling. This is the
+  default mode and is preferred when a suitable target label database is available.
+* `seed-neighborhood` uses the seed again as a post-assembly BLAST anchor, exports a bounded graph
+  neighborhood, and joins only unambiguous candidate paths. This is intended for exploratory work
+  when reference labels are sparse or graph ambiguity should remain visible.
+
+Label-mode example:
+
+    get_organelle_from_reads.py \
+      -1 forward.fq.gz -2 reverse.fq.gz \
+      -s target_seed.fasta \
+      --genes target_labels.fasta \
+      -o target_label_output \
+      -F anonym \
+      --target-extraction label \
+      -P 0 -R 10 -t 10 \
+      --spades-options "--sc" \
+      --overwrite
+
+`--target-extraction label` may be omitted because it is the compatibility-preserving default.
+For `-F anonym`, both `-s` and `--genes` are required in label mode. The label FASTA may contain
+the same sequence as the seed, but a broader, independently curated label set is preferable when
+closely related paralogs or divergent alleles are expected.
+
+Seed-neighborhood example:
+
+    get_organelle_from_reads.py \
+      -1 forward.fq.gz -2 reverse.fq.gz \
+      -s target_seed.fasta \
+      -o target_neighborhood_output \
+      -F anonym \
+      --target-extraction seed-neighborhood \
+      -P 0 -R 10 -t 10 \
+      --target-genome-size 10000 \
+      --target-max-graph-hops 10 \
+      --target-min-identity 70 \
+      --target-min-query-coverage 20 \
+      --target-max-evalue 1e-5 \
+      --spades-options "--sc" \
+      --overwrite
+
+The historical `--general-target` option remains available as an alias for
+`--target-extraction seed-neighborhood`. Combining `--general-target` with
+`--target-extraction label` is an error. Seed-neighborhood-specific threshold, graph, and remapping
+options are rejected in label mode rather than silently ignored. Conversely, `--genes` and
+`--ex-genes` are label-mode inputs and are rejected in seed-neighborhood mode. Seed-neighborhood
+extraction currently accepts exactly one `-F` target and one seed per run.
+
+`--spades-options "--sc"` is not forced by either extraction backend. It can be useful when the
+reads recruited around a custom locus have strongly uneven coverage, even if the original library
+is ordinary WGS. Keep or remove it based on reproducible results for the target and dataset.
+
+Seed-neighborhood outputs:
+
+* `targeted_assembly.fasta`: conservatively joined non-branching candidate paths. Joining stops
+  at graph branches, merges, or cycles.
+* `targeted_assembly.contigs.fasta`: all contigs in the bounded target neighborhood.
+* `targeted_assembly.gfa`: the bounded graph, including unresolved alternatives.
+* `targeted_assembly.nodes.tsv`: graph-node distance from the nearest anchor, length, and coverage.
+* `targeted_assembly.anchor_hits.tsv`: BLAST hits that passed the configured thresholds.
+* `targeted_assembly.paths.tsv`: candidate path composition and stop reasons.
+* `targeted_assembly.warnings.tsv`: possible paralog/allele/fragment and graph-branch warnings.
+
+Seed-neighborhood mode sets `-P 0` and `-R 10` when they are not explicitly provided, because short
+or low-copy nuclear targets do not satisfy the high-copy pre-grouping assumption. Label mode
+preserves upstream defaults, so pass `-P 0` explicitly for a low-copy or short nuclear target. In
+seed-neighborhood mode, the default target size is estimated from the seed length; use
+`--target-genome-size` when the expected genomic span, including introns or flanking sequence, is
+substantially larger.
+
+`--target-remap-reads` optionally runs full-library read mapping against the candidate paths.
+It is disabled by default because it scans the original input and can be computationally expensive.
+
+Candidate paths are hypotheses, not automatically validated genes or haplotypes. Multiple near-best
+seed hits or graph branches should be inspected in the GFA and validated using raw-read support,
+locus context, long reads, or targeted PCR as appropriate.
+
 ### Starting from Assembly
 
   The blue workflow in the chat below shows the processes of `get_organelle_from_assembly.py`.
